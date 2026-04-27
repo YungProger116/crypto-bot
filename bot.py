@@ -276,16 +276,28 @@ def get_binance_ticker(symbol="BTCUSDT"):
         return None
 
 
-def get_binance_liquidations(symbol="BTCUSDT"):
-    """Получаем данные о ликвидациях с Binance API"""
+def get_binance_liquidations(symbol="BTCUSDT", interval="15"):
+    """
+    Получаем ликвидации за последний интервал с фильтром по времени.
+    ИСПРАВЛЕНО: startTime гарантирует что считаем только ликвидации
+    за последний заданный интервал, а не произвольные последние ордера.
+    """
     try:
         if not is_futures_pair_available(symbol):
             logger.debug(f"Пара {symbol} недоступна для запроса ликвидаций")
             return 0.0, 0.0, 0.0
 
+        # Считаем ликвидации строго за последний интервал
+        interval_minutes = int(interval)
+        start_time_ms = int((time.time() - interval_minutes * 60) * 1000)
+
         response = REQUEST_SESSION.get(
             f"{BINANCE_API_URL}/fapi/v1/allForceOrders",
-            params={'symbol': symbol, 'limit': 10},
+            params={
+                'symbol': symbol,
+                'startTime': start_time_ms,
+                'limit': 100
+            },
             timeout=3,
             verify=True
         )
@@ -303,11 +315,11 @@ def get_binance_liquidations(symbol="BTCUSDT"):
 
         if isinstance(liq_data, list):
             for order in liq_data:
-                if order.get('status') in ['FILLED', 'LIQUIDATED'] and order.get('forceClose', False):
-                    quantity = float(order['executedQty'])
-                    price = float(order['avgPrice'])
+                if order.get('status') == 'FILLED':
+                    quantity = float(order.get('executedQty', 0))
+                    price = float(order.get('avgPrice', 0))
                     value = quantity * price
-
+                    # BUY = ликвидация шорта, SELL = ликвидация лонга
                     if order['side'] == 'BUY':
                         short_liq += value
                     elif order['side'] == 'SELL':
@@ -317,7 +329,6 @@ def get_binance_liquidations(symbol="BTCUSDT"):
         return total_liq, long_liq, short_liq
 
     except requests.exceptions.RequestException as e:
-        # ИСПРАВЛЕНИЕ: корректная проверка наличия атрибута response
         if hasattr(e, 'response') and e.response is not None and e.response.status_code == 400:
             logger.debug(f"Пара {symbol} не поддерживает запрос ликвидаций: 400 Bad Request")
         else:
@@ -341,29 +352,27 @@ def analyze_market(symbol, interval="15", enable_liq=False):
             return None
 
         latest_candle = kline[-1]
-        open_price = float(latest_candle[1])
+        prev_candle = kline[-2]
         current_price = binance_data['price']
 
-        if open_price == 0:
+        # ИСПРАВЛЕНО: сравниваем текущую цену с ЗАКРЫТИЕМ предыдущей свечи
+        # (не с открытием текущей — это давало почти нулевое изменение)
+        prev_close = float(prev_candle[4])  # индекс 4 = close price
+        if prev_close == 0:
             price_change = 0.0
         else:
-            price_change = ((current_price - open_price) / open_price * 100)
+            price_change = ((current_price - prev_close) / prev_close * 100)
 
         latest_volume = float(latest_candle[5])
-        prev_candle = kline[-2]
-
-        if prev_candle:
-            prev_volume = float(prev_candle[5])
-            if prev_volume == 0:
-                volume_change = 0.0
-            else:
-                volume_change = ((latest_volume - prev_volume) / prev_volume * 100)
-        else:
+        prev_volume = float(prev_candle[5])
+        if prev_volume == 0:
             volume_change = 0.0
+        else:
+            volume_change = ((latest_volume - prev_volume) / prev_volume * 100)
 
         total_liq, long_liq, short_liq = 0.0, 0.0, 0.0
         if enable_liq:
-            total_liq, long_liq, short_liq = get_binance_liquidations(symbol)
+            total_liq, long_liq, short_liq = get_binance_liquidations(symbol, interval)
 
         return {
             'symbol': symbol,
