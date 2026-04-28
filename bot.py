@@ -11,6 +11,8 @@ import telebot
 from telebot import types
 import threading
 import time
+import random
+import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib3
 
@@ -28,18 +30,19 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 BINANCE_API_URL = "https://fapi.binance.com"
-BYBIT_API_URL = "https://api.bybit.com"
+BYBIT_API_URL = "https://api.bybit.com"  # ДОБАВЛЕНО
 COINGLASS_WEBHOOK_URL = os.getenv("COINGLASS_WEBHOOK_URL")
 
 if not TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN не найден в .env файле")
 
-# Кэш доступных фьючерсных пар
-AVAILABLE_PAIRS = {'Binance': set(), 'Bybit': set()}
+# Кэш доступных фьючерсных пар (ИЗМЕНЕНО для поддержки бирж)
+AVAILABLE_FUTURES_PAIRS = {'Binance': set(), 'Bybit': set()}
 LAST_FUTURES_UPDATE = 0
 FUTURES_UPDATE_INTERVAL = 3600  # 1 час
 
 
+# Создание сессии с повторными попытками
 def create_session():
     session = requests.Session()
     retry_strategy = Retry(
@@ -48,277 +51,466 @@ def create_session():
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=['GET']
     )
-    adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=100, pool_maxsize=100)
+    adapter = HTTPAdapter(
+        max_retries=retry_strategy,
+        pool_connections=100,
+        pool_maxsize=100
+    )
     session.mount('https://', adapter)
     session.mount('http://', adapter)
     session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     })
     return session
 
 
+# Глобальная сессия для всех запросов
 REQUEST_SESSION = create_session()
+
 bot = telebot.TeleBot(TOKEN)
 
 user_states = {}
-user_settings = defaultdict(dict)
+user_settings = defaultdict(lambda: {
+    'enable_price': True,
+    'enable_volume': True,
+    'enable_oi': True,
+    'enable_liq': True,
+    'price_threshold': 1.5,
+    'volume_threshold': 50.0,
+    'oi_threshold': 5.0,
+    'liq_threshold': 1000000,
+    'interval': "15",
+    'condition_mode': 'ANY'  # ДОБАВЛЕНО: 'ANY' (Любое) или 'ALL' (Все)
+})
+
 signal_counters = {}
 lock = threading.Lock()
+# ИСПРАВЛЕНИЕ: отдельный лок для кэша данных
 cache_lock = threading.Lock()
+# ИСПРАВЛЕНИЕ: отдельный лок для OI данных
 oi_lock = threading.Lock()
 active_monitors = {}
 data_cache = {}
-cache_expiry = 2
+cache_expiry = 2  # Кэширование данных на 2 секунды
 daily_counters_reset = defaultdict(float)
 monitoring_progress = defaultdict(dict)
 prev_oi_data = defaultdict(dict)
+last_analysis_time = defaultdict(dict)
 
+# Поддерживаемые интервалы Binance
 SUPPORTED_INTERVALS = {
-    "1": "1m", "3": "3m", "5": "5m", "15": "15m", "30": "30m",
-    "60": "1h", "120": "2h", "240": "4h", "360": "6h", "480": "8h",
-    "720": "12h", "1440": "1d", "10080": "1w"
+    "1": "1m",
+    "3": "3m",
+    "5": "5m",
+    "15": "15m",
+    "30": "30m",
+    "60": "1h",
+    "120": "2h",
+    "240": "4h",
+    "360": "6h",
+    "480": "8h",
+    "720": "12h",
+    "1440": "1d",
+    "10080": "1w"
 }
 
-BYBIT_INTERVALS = {
-    "1": "1", "3": "3", "5": "5", "15": "15", "30": "30",
-    "60": "60", "120": "120", "240": "240", "360": "360",
-    "720": "720", "1440": "D", "10080": "W"
-}
-
+# Читаемые названия интервалов
 INTERVAL_READABLE = {
-    "1m": "1 минута", "3m": "3 минуты", "5m": "5 минут", "15m": "15 минут",
-    "30m": "30 минут", "1h": "1 час", "2h": "2 часа", "4h": "4 часа",
-    "6h": "6 часов", "8h": "8 часов", "12h": "12 часов", "1d": "1 день", "1w": "1 неделя"
+    "1m": "1 минута",
+    "3m": "3 минуты",
+    "5m": "5 минут",
+    "15m": "15 минут",
+    "30m": "30 минут",
+    "1h": "1 час",
+    "2h": "2 часа",
+    "4h": "4 часа",
+    "6h": "6 часов",
+    "8h": "8 часов",
+    "12h": "12 часов",
+    "1d": "1 день",
+    "1w": "1 неделя"
 }
 
 
-def update_available_pairs(force_update=False):
-    global AVAILABLE_PAIRS, LAST_FUTURES_UPDATE
+def get_available_futures_pairs(force_update=False):
+    """ИЗМЕНЕНО: Получает и кэширует список пар для Binance и Bybit"""
+    global AVAILABLE_FUTURES_PAIRS, LAST_FUTURES_UPDATE
+
     current_time = time.time()
 
-    if not force_update and current_time - LAST_FUTURES_UPDATE < FUTURES_UPDATE_INTERVAL:
-        return AVAILABLE_PAIRS
+    if not force_update and current_time - LAST_FUTURES_UPDATE < FUTURES_UPDATE_INTERVAL and (
+            AVAILABLE_FUTURES_PAIRS['Binance'] or AVAILABLE_FUTURES_PAIRS['Bybit']):
+        return AVAILABLE_FUTURES_PAIRS
 
-    # Binance
+    # --- Binance ---
     try:
-        res = REQUEST_SESSION.get(f"{BINANCE_API_URL}/fapi/v1/exchangeInfo", timeout=10)
-        res.raise_for_status()
-        binance_pairs = set(s['symbol'] for s in res.json()['symbols'] if
-                            s['status'] == 'TRADING' and s['quoteAsset'] in ['USDT', 'USDC'])
-        AVAILABLE_PAIRS['Binance'] = binance_pairs
+        url = f"{BINANCE_API_URL}/fapi/v1/exchangeInfo"
+        response = REQUEST_SESSION.get(url, timeout=15, verify=True)
+        data = response.json()
+        AVAILABLE_FUTURES_PAIRS['Binance'] = {
+            s['symbol'] for s in data['symbols']
+            if s['status'] == 'TRADING' and s['contractType'] == 'PERPETUAL' and s['quoteAsset'] in ['USDT', 'USDC']
+        }
     except Exception as e:
-        logger.error(f"Binance pairs error: {e}")
+        logger.error(f"Ошибка Binance exchangeInfo: {e}")
 
-    # Bybit
+    # --- Bybit ---
     try:
-        res = REQUEST_SESSION.get(f"{BYBIT_API_URL}/v5/market/instruments-info?category=linear", timeout=10)
-        res.raise_for_status()
-        bybit_pairs = set(s['symbol'] for s in res.json()['result']['list'] if
-                          s['status'] == 'Trading' and s['quoteCoin'] in ['USDT', 'USDC'])
-        AVAILABLE_PAIRS['Bybit'] = bybit_pairs
+        url = f"{BYBIT_API_URL}/v5/market/instruments-info?category=linear"
+        response = REQUEST_SESSION.get(url, timeout=15, verify=True)
+        data = response.json()
+        AVAILABLE_FUTURES_PAIRS['Bybit'] = {
+            s['symbol'] for s in data['result']['list']
+            if s['status'] == 'Trading' and s['quoteCoin'] in ['USDT', 'USDC']
+        }
     except Exception as e:
-        logger.error(f"Bybit pairs error: {e}")
+        logger.error(f"Ошибка Bybit exchangeInfo: {e}")
 
     LAST_FUTURES_UPDATE = current_time
-    logger.info(f"Обновлены списки: {len(AVAILABLE_PAIRS['Binance'])} Binance, {len(AVAILABLE_PAIRS['Bybit'])} Bybit")
-    return AVAILABLE_PAIRS
+    return AVAILABLE_FUTURES_PAIRS
 
 
-def get_binance_data(symbol, interval_val, enable_liq):
-    cache_key = f"binance_data_{symbol}_{interval_val}"
+def is_futures_pair_available(symbol, exchange='Binance'):
+    """Проверяет доступность пары на конкретной бирже"""
+    available = get_available_futures_pairs()
+    return symbol in available.get(exchange, set())
+
+
+def send_coin_glass_signal(signal_type: str, symbol: str, price: float, volume: float = None,
+                           price_change: float = None, oi_change: float = None):
+    if not COINGLASS_WEBHOOK_URL:
+        logger.warning("COINGLASS_WEBHOOK_URL не настроен в .env файле")
+        return
+
+    payload = {
+        "type": signal_type,
+        "symbol": symbol,
+        "price": price,
+        "timestamp": int(time.time())
+    }
+
+    if volume:
+        payload["volume"] = volume
+    if price_change is not None:
+        payload["price_change"] = price_change
+    if oi_change is not None:
+        payload["oi_change"] = oi_change
+
+    try:
+        response = REQUEST_SESSION.post(
+            COINGLASS_WEBHOOK_URL,
+            json=payload,
+            timeout=5,
+            verify=True
+        )
+        if response.status_code == 200:
+            logger.info(f"✅ Сигнал {signal_type} для {symbol} отправлен в CoinGlass!")
+        else:
+            logger.warning(f"❌ Ошибка отправки в CoinGlass: {response.status_code} {response.text}")
+    except Exception as e:
+        logger.error(f"⚠️ Ошибка при отправке в CoinGlass: {e}")
+
+
+def get_binance_kline(symbol="BTCUSDT", interval="15", limit=2):
+    """Получаем свечные данные с Binance API"""
+    cache_key = f"kline_{symbol}_{interval}"
     current_time = time.time()
 
     with cache_lock:
-        if cache_key in data_cache and current_time - data_cache[cache_key][1] < cache_expiry:
-            return data_cache[cache_key][0]
+        if cache_key in data_cache:
+            cached_data, timestamp = data_cache[cache_key]
+            if current_time - timestamp < cache_expiry:
+                return cached_data
 
     try:
-        # Ticker & OI
-        ticker_res = REQUEST_SESSION.get(f"{BINANCE_API_URL}/fapi/v1/ticker/24hr?symbol={symbol}", timeout=5).json()
-        oi_res = REQUEST_SESSION.get(f"{BINANCE_API_URL}/fapi/v1/openInterest?symbol={symbol}", timeout=5).json()
+        if not is_futures_pair_available(symbol, 'Binance'):
+            return None
 
-        # Klines
-        binance_interval = SUPPORTED_INTERVALS.get(interval_val, "15m")
-        kline = REQUEST_SESSION.get(f"{BINANCE_API_URL}/fapi/v1/klines",
-                                    params={'symbol': symbol, 'interval': binance_interval, 'limit': 2},
-                                    timeout=5).json()
+        binance_interval = SUPPORTED_INTERVALS.get(interval, "15m")
+        url = f"{BINANCE_API_URL}/fapi/v1/klines"
+        params = {'symbol': symbol, 'interval': binance_interval, 'limit': limit}
+        response = REQUEST_SESSION.get(url, params=params, timeout=10, verify=True)
+        data = response.json()
 
-        if len(kline) < 2: return None
+        with cache_lock:
+            data_cache[cache_key] = (data, current_time)
+        return data
+    except Exception as e:
+        logger.error(f"Binance kline error for {symbol}: {e}")
+        return None
 
-        latest_candle, prev_candle = kline[-1], kline[-2]
-        open_price, current_price = float(latest_candle[1]), float(ticker_res['lastPrice'])
-        price_change = ((current_price - open_price) / open_price * 100) if open_price > 0 else 0.0
 
-        latest_vol, prev_vol = float(latest_candle[5]), float(prev_candle[5])
-        volume_change = ((latest_vol - prev_vol) / prev_vol * 100) if prev_vol > 0 else 0.0
+def get_binance_ticker(symbol="BTCUSDT"):
+    """Получаем полные данные с Binance API"""
+    cache_key = f"ticker_{symbol}"
+    current_time = time.time()
 
-        # Ликвидации за интервал
-        total_liq = 0.0
-        if enable_liq:
-            try:
-                liq_res = REQUEST_SESSION.get(f"{BINANCE_API_URL}/fapi/v1/allForceOrders",
-                                              params={'symbol': symbol, 'limit': 1000}, timeout=5)
-                if liq_res.status_code == 200:
-                    cutoff_time = int(time.time() * 1000) - (int(interval_val) * 60 * 1000)
-                    for order in liq_res.json():
-                        if order.get('time', 0) >= cutoff_time:
-                            total_liq += float(order['executedQty']) * float(order['avgPrice'])
-            except:
-                pass
+    with cache_lock:
+        if cache_key in data_cache:
+            cached_data, timestamp = data_cache[cache_key]
+            if current_time - timestamp < cache_expiry:
+                return cached_data
+
+    try:
+        if not is_futures_pair_available(symbol, 'Binance'):
+            return None
+
+        ticker_response = REQUEST_SESSION.get(f"{BINANCE_API_URL}/fapi/v1/ticker/24hr?symbol={symbol}",
+                                              timeout=10).json()
+        oi_response = REQUEST_SESSION.get(f"{BINANCE_API_URL}/fapi/v1/openInterest?symbol={symbol}", timeout=10).json()
 
         result = {
-            'exchange': 'Binance', 'symbol': symbol, 'price': current_price, 'price_change': price_change,
-            'volume': latest_vol, 'volume_change': volume_change, 'oi': float(oi_res.get('openInterest', 0)),
-            'total_liq': total_liq, 'timestamp': ticker_res['closeTime']
+            'symbol': symbol,
+            'price': float(ticker_response['lastPrice']),
+            'price_change': float(ticker_response['priceChangePercent']),
+            'volume': float(ticker_response['volume']),
+            'quote_volume': float(ticker_response['quoteVolume']),
+            'oi': float(oi_response['openInterest']),
+            'timestamp': ticker_response['closeTime']
         }
+
         with cache_lock:
             data_cache[cache_key] = (result, current_time)
         return result
     except Exception as e:
+        logger.error(f"Binance ticker error for {symbol}: {str(e)}")
         return None
 
 
-def get_bybit_data(symbol, interval_val, enable_liq):
+def get_bybit_market_data(symbol, interval="15"):
+    """ДОБАВЛЕНО: Получение данных с Bybit V5"""
     try:
-        # Ticker (включает OI и 24h vol)
-        ticker_res = REQUEST_SESSION.get(f"{BYBIT_API_URL}/v5/market/tickers?category=linear&symbol={symbol}",
-                                         timeout=5).json()
-        if not ticker_res['result']['list']: return None
-        t_data = ticker_res['result']['list'][0]
+        # Тикер и OI
+        t_res = REQUEST_SESSION.get(f"{BYBIT_API_URL}/v5/market/tickers?category=linear&symbol={symbol}",
+                                    timeout=5).json()
+        t_data = t_res['result']['list'][0]
 
-        current_price = float(t_data['lastPrice'])
-        oi = float(t_data.get('openInterest', 0))
-
-        # Klines
-        bybit_interval = BYBIT_INTERVALS.get(interval_val, "15")
-        kline_res = REQUEST_SESSION.get(
+        # Клайны для объема
+        bybit_interval = interval if interval != "1440" else "D"
+        k_res = REQUEST_SESSION.get(
             f"{BYBIT_API_URL}/v5/market/kline?category=linear&symbol={symbol}&interval={bybit_interval}&limit=2",
             timeout=5).json()
-        k_list = kline_res['result']['list']
-        if len(k_list) < 2: return None
+        k_list = k_res['result']['list']
 
-        # Bybit отдает новые свечи первыми! k_list[0] - текущая, k_list[1] - предыдущая
-        latest_candle, prev_candle = k_list[0], k_list[1]
+        curr_k = k_list[0]
+        prev_k = k_list[1]
 
-        open_price = float(latest_candle[1])
-        price_change = ((current_price - open_price) / open_price * 100) if open_price > 0 else 0.0
+        p_now = float(t_data['lastPrice'])
+        p_open = float(curr_k[1])
+        v_now = float(curr_k[5])
+        v_prev = float(prev_k[5])
 
-        latest_vol, prev_vol = float(latest_candle[5]), float(prev_candle[5])
-        volume_change = ((latest_vol - prev_vol) / prev_vol * 100) if prev_vol > 0 else 0.0
-
-        result = {
-            'exchange': 'Bybit', 'symbol': symbol, 'price': current_price, 'price_change': price_change,
-            'volume': latest_vol, 'volume_change': volume_change, 'oi': oi,
-            'total_liq': 0.0,  # У Bybit нет публичного REST для ликвидаций
-            'timestamp': int(time.time() * 1000)
+        return {
+            'symbol': symbol,
+            'price': p_now,
+            'price_change': ((p_now - p_open) / p_open * 100) if p_open else 0,
+            'volume': v_now,
+            'volume_change': ((v_now - v_prev) / v_prev * 100) if v_prev else 0,
+            'oi': float(t_data.get('openInterest', 0)),
+            'total_liq': 0.0,  # Ликвидации по API Bybit требуют WebSocket для всех пар
+            'timestamp': int(time.time() * 1000),
+            'exchange': 'Bybit'
         }
-        return result
     except Exception as e:
+        logger.error(f"Bybit data error for {symbol}: {e}")
         return None
+
+
+def get_binance_liquidations(symbol="BTCUSDT", interval_min="15"):
+    """ИСПРАВЛЕНО: Считаем ликвидации суммарно за выбранный интервал"""
+    try:
+        if not is_futures_pair_available(symbol, 'Binance'):
+            return 0.0, 0.0, 0.0
+
+        response = REQUEST_SESSION.get(
+            f"{BINANCE_API_URL}/fapi/v1/allForceOrders",
+            params={'symbol': symbol, 'limit': 1000},
+            timeout=5
+        )
+        liq_data = response.json()
+
+        cutoff_time = int(time.time() * 1000) - (int(interval_min) * 60 * 1000)
+        long_liq, short_liq = 0.0, 0.0
+
+        if isinstance(liq_data, list):
+            for order in liq_data:
+                order_time = int(order.get('time', 0))
+                if order_time >= cutoff_time:
+                    value = float(order['executedQty']) * float(order['avgPrice'])
+                    if order['side'] == 'SELL':
+                        long_liq += value
+                    else:
+                        short_liq += value
+
+        return (long_liq + short_liq), long_liq, short_liq
+    except Exception as e:
+        logger.debug(f"Ошибка ликвидаций для {symbol}: {str(e)}")
+        return 0.0, 0.0, 0.0
 
 
 def analyze_market(exchange, symbol, interval="15", enable_liq=False):
-    if exchange == 'Binance':
-        return get_binance_data(symbol, interval, enable_liq)
-    elif exchange == 'Bybit':
-        return get_bybit_data(symbol, interval, enable_liq)
-    return None
+    """ИЗМЕНЕНО: Поддержка бирж"""
+    if exchange == 'Bybit':
+        return get_bybit_market_data(symbol, interval)
+
+    try:
+        binance_data = get_binance_ticker(symbol)
+        if not binance_data: return None
+
+        kline = get_binance_kline(symbol, interval, limit=2)
+        if not kline or len(kline) < 2: return None
+
+        latest_candle = kline[-1]
+        open_price = float(latest_candle[1])
+        current_price = binance_data['price']
+        price_change = ((current_price - open_price) / open_price * 100) if open_price else 0
+
+        latest_volume = float(latest_candle[5])
+        prev_volume = float(kline[-2][5])
+        volume_change = ((latest_volume - prev_volume) / prev_volume * 100) if prev_volume else 0
+
+        total_liq, long_liq, short_liq = 0.0, 0.0, 0.0
+        if enable_liq:
+            total_liq, long_liq, short_liq = get_binance_liquidations(symbol, interval)
+
+        return {
+            'symbol': symbol, 'price': current_price, 'price_change': price_change,
+            'volume': latest_volume, 'volume_change': volume_change,
+            'oi': binance_data['oi'], 'total_liq': total_liq,
+            'long_liq': long_liq, 'short_liq': short_liq,
+            'timestamp': binance_data['timestamp'], 'exchange': 'Binance'
+        }
+    except Exception as e:
+        logger.error(f"Analysis error for {symbol}: {str(e)}")
+        return None
 
 
-def get_all_markets():
-    pairs = update_available_pairs()
-    markets = []
-    for exch, symbols in pairs.items():
-        for sym in symbols:
-            markets.append({'exchange': exch, 'symbol': sym})
-    return markets
+def get_all_futures_symbols():
+    """Получаем все пары с обеих бирж"""
+    available = get_available_futures_pairs()
+    targets = []
+    for s in available['Binance']: targets.append(('Binance', s))
+    for s in available['Bybit']: targets.append(('Bybit', s))
+    return targets
 
 
 def get_main_keyboard():
     keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    keyboard.add("📈 Цена BTC", "🔍 Анализ BTC", "🧠 Автосигналы", "📡 Статус мониторинга", "⚙ Настроить сигналы",
-                 "ℹ️ Помощь")
+    buttons = ["📈 Цена BTC", "🔍 Анализ BTC", "🧠 Автосигналы", "📡 Статус мониторинга", "⚙ Настроить сигналы",
+               "ℹ️ Помощь"]
+    keyboard.add(*buttons)
     return keyboard
 
 
-def get_settings_keyboard():
+def get_settings_keyboard(chat_id):
+    """ИЗМЕНЕНО: Добавлена кнопка AND/OR"""
     keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    keyboard.add(
-        "💰 Порог цены", "📊 Порог объема", "📈 Порог OI", "💧 Порог ликвидаций",
-        "🔔 Вкл/Выкл Цену", "🔔 Вкл/Выкл Объем", "🔔 Вкл/Выкл OI", "🔔 Вкл/Выкл Ликвидации",
-        "🔄 Режим: ЛЮБОЕ / ВСЕ", "⏱ Интервал анализа", "✅ Сохранить настройки", "↩️ Назад"
-    )
+    s = user_settings[chat_id]
+    mode_text = "🔄 Режим: ВСЕ (AND) ✅" if s.get('condition_mode') == 'ALL' else "🔄 Режим: ЛЮБОЕ (OR) 🔀"
+
+    buttons = [
+        "💰 Порог цены", "📊 Порог объема", "📈 Порог OI", "⏱ Интервал анализа", "💧 Порог ликвидаций",
+        f"🔔 Цена: {'✅' if s.get('enable_price') else '❌'}",
+        f"🔔 Объем: {'✅' if s.get('enable_volume') else '❌'}",
+        f"🔔 OI: {'✅' if s.get('enable_oi') else '❌'}",
+        f"🔔 Ликв: {'✅' if s.get('enable_liq') else '❌'}",
+        mode_text, "✅ Сохранить настройки", "↩️ Назад"
+    ]
+    keyboard.add(*buttons)
     return keyboard
 
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    bot.send_message(message.chat.id,
-                     "🤖 Добро пожаловать в <b>Crypto Market Scanner Pro</b>!\nМониторинг Binance и Bybit.",
-                     parse_mode='HTML', reply_markup=get_main_keyboard())
+    chat_id = message.chat.id
+    welcome_msg = (
+        "🤖 Добро пожаловать в <b>Crypto Market Scanner Pro</b>!\n\n"
+        "📊 <b>Возможности бота:</b>\n"
+        "• Мониторинг Binance + Bybit\n"
+        "• Настраиваемая логика AND/OR\n"
+        "• Точный расчет ликвидаций за интервал\n\n"
+        "⚡️ <b>Быстрый старт:</b>\n"
+        "1. Нажмите ⚙ Настроить сигналы\n"
+        "2. Установите пороги и выберите режим (ЛЮБОЕ или ВСЕ)\n"
+        "3. Запустите 🧠 Автосигналы"
+    )
+    bot.send_message(chat_id, welcome_msg, parse_mode='HTML', reply_markup=get_main_keyboard())
 
 
-@bot.message_handler(func=lambda msg: msg.text == "↩️ Назад")
-def back_to_main(message):
-    bot.send_message(message.chat.id, "Главное меню:", reply_markup=get_main_keyboard())
+@bot.message_handler(func=lambda msg: "🔄 Режим:" in msg.text)
+def toggle_condition_mode(message):
+    chat_id = message.chat.id
+    current = user_settings[chat_id].get('condition_mode', 'ANY')
+    user_settings[chat_id]['condition_mode'] = 'ALL' if current == 'ANY' else 'ANY'
+    bot.send_message(chat_id, f"✅ Режим изменен на: {user_settings[chat_id]['condition_mode']}",
+                     reply_markup=get_settings_keyboard(chat_id))
+
+
+@bot.message_handler(func=lambda msg: msg.text.startswith("🔔"))
+def toggle_setting(message):
+    chat_id = message.chat.id
+    txt = message.text
+    if "Цена" in txt:
+        user_settings[chat_id]['enable_price'] = not user_settings[chat_id].get('enable_price', True)
+    elif "Объем" in txt:
+        user_settings[chat_id]['enable_volume'] = not user_settings[chat_id].get('enable_volume', True)
+    elif "OI" in txt:
+        user_settings[chat_id]['enable_oi'] = not user_settings[chat_id].get('enable_oi', True)
+    elif "Ликв" in txt:
+        user_settings[chat_id]['enable_liq'] = not user_settings[chat_id].get('enable_liq', True)
+    bot.send_message(chat_id, "⚙️ Обновлено", reply_markup=get_settings_keyboard(chat_id))
 
 
 @bot.message_handler(func=lambda msg: msg.text == "📈 Цена BTC")
 def price_btn(message):
-    data = get_binance_data("BTCUSDT", "15", False)
+    data = get_binance_ticker("BTCUSDT")
     if data:
-        bot.send_message(message.chat.id, f"💰 <b>BTC/USDT (Binance)</b>\nЦена: {data['price']}$", parse_mode='HTML')
-    else:
-        bot.send_message(message.chat.id, "❌ Ошибка получения данных")
+        update_time = datetime.fromtimestamp(data['timestamp'] / 1000).strftime('%H:%M:%S')
+        msg = (
+            f"💰 <b>BTC/USDT (Binance)</b>\n\n"
+            f"• Цена: <b>{data['price']}$</b>\n"
+            f"• Изменение 24ч: <b>{data['price_change']:+.2f}%</b>\n"
+            f"🕒 Обновлено: {update_time} UTC"
+        )
+        bot.send_message(message.chat.id, msg, parse_mode='HTML')
+
+
+@bot.message_handler(func=lambda msg: msg.text == "🔍 Анализ BTC")
+def scan_btn(message):
+    chat_id = message.chat.id
+    s = user_settings[chat_id]
+    status_msg = bot.send_message(chat_id, "🔄 Анализирую BTC/USDT...")
+    analysis = analyze_market('Binance', "BTCUSDT", interval=s['interval'], enable_liq=s['enable_liq'])
+
+    if analysis:
+        msg = (
+            f"🔍 <b>BTC/USDT Анализ</b>\n"
+            f"💰 Цена: <b>{analysis['price']:.2f}$</b> ({analysis['price_change']:+.2f}%)\n"
+            f"📊 Объем: {analysis['volume_change']:+.2f}%\n"
+            f"💧 Ликв: {analysis['total_liq']:,.0f}$\n"
+            f"⏱ Интервал: {s['interval']}м"
+        )
+        bot.edit_message_text(msg, chat_id, status_msg.message_id, parse_mode='HTML')
 
 
 @bot.message_handler(func=lambda msg: msg.text == "⚙ Настроить сигналы")
 def setup_signals(message):
     chat_id = message.chat.id
-    if chat_id not in user_settings:
-        user_settings[chat_id] = {
-            'enable_price': True, 'enable_volume': True, 'enable_oi': True, 'enable_liq': True,
-            'price_threshold': 1.5, 'volume_threshold': 50.0, 'oi_threshold': 5.0, 'liq_threshold': 1000000,
-            'interval': "15", 'condition_mode': 'ANY'
-        }
-    bot.send_message(chat_id, "⚙️ <b>Настройки:</b>\nВыберите параметр для изменения:", parse_mode='HTML',
-                     reply_markup=get_settings_keyboard())
-
-
-@bot.message_handler(func=lambda msg: msg.text == "🔄 Режим: ЛЮБОЕ / ВСЕ")
-def toggle_mode(message):
-    chat_id = message.chat.id
-    current = user_settings.get(chat_id, {}).get('condition_mode', 'ANY')
-    new_mode = 'ALL' if current == 'ANY' else 'ANY'
-    user_settings[chat_id]['condition_mode'] = new_mode
-    mode_text = "ВСЕ (AND)" if new_mode == 'ALL' else "ЛЮБОЕ (OR)"
-    bot.send_message(chat_id,
-                     f"✅ Режим изменен. Теперь для сигнала требуется срабатывание: <b>{mode_text}</b> включенных условий.",
-                     parse_mode='HTML')
-
-
-@bot.message_handler(
-    func=lambda msg: msg.text in ["🔔 Вкл/Выкл Цену", "🔔 Вкл/Выкл Объем", "🔔 Вкл/Выкл OI", "🔔 Вкл/Выкл Ликвидации"])
-def toggle_setting(message):
-    chat_id = message.chat.id
-    key_map = {"Цену": "enable_price", "Объем": "enable_volume", "OI": "enable_oi", "Ликвидации": "enable_liq"}
-    key = key_map[message.text.split()[-1]]
-    user_settings[chat_id][key] = not user_settings.get(chat_id, {}).get(key, True)
-    status = "✅ ВКЛЮЧЕНО" if user_settings[chat_id][key] else "❌ ВЫКЛЮЧЕНО"
-    bot.send_message(chat_id, f"✅ Параметр теперь {status}")
+    bot.send_message(chat_id, "⚙️ Настройки параметров:", reply_markup=get_settings_keyboard(chat_id))
 
 
 @bot.message_handler(func=lambda msg: msg.text in ["💰 Порог цены", "📊 Порог объема", "📈 Порог OI", "⏱ Интервал анализа",
                                                    "💧 Порог ликвидаций"])
 def setting_selection(message):
     chat_id = message.chat.id
-    settings_map = {
+    text = message.text
+    params = {
         "💰 Порог цены": "price_threshold", "📊 Порог объема": "volume_threshold",
-        "📈 Порог OI": "oi_threshold", "⏱ Интервал анализа": "interval", "💧 Порог ликвидаций": "liq_threshold"
+        "📈 Порог OI": "oi_threshold", "⏱ Интервал анализа": "interval",
+        "💧 Порог ликвидаций": "liq_threshold"
     }
-    user_states[chat_id] = {'setting': settings_map[message.text]}
-    bot.send_message(chat_id, f"✍️ Введите новое значение для {message.text}:",
-                     reply_markup=types.ReplyKeyboardRemove())
+    user_states[chat_id] = {'setting': params[text]}
+    bot.send_message(chat_id, f"✍️ Введите новое значение для: {text}", reply_markup=types.ReplyKeyboardRemove())
 
 
 @bot.message_handler(func=lambda msg: msg.chat.id in user_states and 'setting' in user_states[msg.chat.id])
@@ -326,131 +518,161 @@ def handle_setting_input(message):
     chat_id = message.chat.id
     setting = user_states[chat_id]['setting']
     try:
-        val = message.text if setting == 'interval' else float(message.text.replace(',', ''))
-        user_settings[chat_id][setting] = val
+        val = message.text.replace(',', '').replace(' ', '')
+        user_settings[chat_id][setting] = val if setting == 'interval' else float(val)
         del user_states[chat_id]
-        bot.send_message(chat_id, "✅ Значение сохранено!", reply_markup=get_settings_keyboard())
-    except ValueError:
-        bot.send_message(chat_id, "❌ Неверный формат.")
+        bot.send_message(chat_id, "✅ Сохранено", reply_markup=get_settings_keyboard(chat_id))
+    except:
+        bot.send_message(chat_id, "❌ Введите число")
 
 
 @bot.message_handler(func=lambda msg: msg.text == "✅ Сохранить настройки")
 def save_settings(message):
-    bot.send_message(message.chat.id, "🎉 Настройки сохранены!", reply_markup=get_main_keyboard())
+    bot.send_message(message.chat.id, "🎉 Настройки применены!", reply_markup=get_main_keyboard())
 
 
-def check_signal_conditions(analysis, settings, chat_id, exchange, symbol):
-    price_change = analysis['price_change']
-    volume_change = analysis['volume_change']
-    oi = analysis['oi']
-    total_liq = analysis['total_liq']
+@bot.message_handler(func=lambda msg: msg.text == "↩️ Назад")
+def go_back(message):
+    bot.send_message(message.chat.id, "Главное меню", reply_markup=get_main_keyboard())
 
-    oi_key = f"{chat_id}_{exchange}_{symbol}"
+
+def check_signal_conditions(analysis, settings, chat_id, symbol):
+    """ИСПРАВЛЕНО: Логика ANY/ALL"""
+    res = {
+        'price_match': False, 'volume_match': False, 'oi_match': False, 'liq_match': False,
+        'oi_change_pct': 0.0, 'price_change': analysis['price_change'],
+        'volume_change': analysis['volume_change'], 'total_liq': analysis['total_liq']
+    }
+
+    # OI Change
+    prev_oi_key = f"{chat_id}_{symbol}"
     with oi_lock:
-        if oi_key not in prev_oi_data:
-            prev_oi_data[oi_key] = {'value': oi, 'first': True}
-            oi_change_pct = 0.0
+        current_oi = analysis['oi']
+        if prev_oi_key not in prev_oi_data:
+            prev_oi_data[prev_oi_key] = {'value': current_oi, 'first_measurement': True}
         else:
-            prev_val = prev_oi_data[oi_key]['value']
-            oi_change_pct = ((oi - prev_val) / prev_val * 100) if prev_val > 0 else 0.0
-            prev_oi_data[oi_key] = {'value': oi, 'first': False}
+            prev_val = prev_oi_data[prev_oi_key]['value']
+            res['oi_change_pct'] = ((current_oi - prev_val) / prev_val * 100) if prev_val else 0
+            prev_oi_data[prev_oi_key]['value'] = current_oi
 
-    active_conditions = []
-    matched_conditions = []
-    triggers = []
+    active_filters = []
+    matches = []
 
-    if settings.get('enable_price', True):
-        active_conditions.append('price')
-        t = settings.get('price_threshold', 1.5)
-        if (t >= 0 and price_change >= t) or (t < 0 and price_change <= t):
-            matched_conditions.append('price')
-            triggers.append(f"💰 Цена: {price_change:+.2f}%")
+    if settings.get('enable_price'):
+        active_filters.append('price')
+        p_t = settings.get('price_threshold', 1.5)
+        m = (analysis['price_change'] >= p_t) if p_t >= 0 else (analysis['price_change'] <= p_t)
+        if m: matches.append('price')
+        res['price_match'] = m
 
-    if settings.get('enable_volume', True):
-        active_conditions.append('volume')
-        t = settings.get('volume_threshold', 50.0)
-        if (t >= 0 and volume_change >= t) or (t < 0 and volume_change <= t):
-            matched_conditions.append('volume')
-            triggers.append(f"📊 Объем: {volume_change:+.2f}%")
+    if settings.get('enable_volume'):
+        active_filters.append('volume')
+        v_t = settings.get('volume_threshold', 50.0)
+        m = analysis['volume_change'] >= v_t
+        if m: matches.append('volume')
+        res['volume_match'] = m
 
-    if settings.get('enable_oi', True):
-        active_conditions.append('oi')
-        t = settings.get('oi_threshold', 5.0)
-        if (t >= 0 and oi_change_pct >= t) or (t < 0 and oi_change_pct <= t):
-            matched_conditions.append('oi')
-            triggers.append(f"📈 OI: {oi_change_pct:+.2f}%")
+    if settings.get('enable_oi'):
+        active_filters.append('oi')
+        oi_t = settings.get('oi_threshold', 5.0)
+        m = (res['oi_change_pct'] >= oi_t) if oi_t >= 0 else (res['oi_change_pct'] <= oi_t)
+        if m: matches.append('oi')
+        res['oi_match'] = m
 
-    if settings.get('enable_liq', True) and exchange == 'Binance':
-        active_conditions.append('liq')
-        if total_liq >= settings.get('liq_threshold', 1000000):
-            matched_conditions.append('liq')
-            triggers.append(f"💧 Ликв: {total_liq:,.0f}$")
+    if settings.get('enable_liq'):
+        active_filters.append('liq')
+        m = analysis['total_liq'] >= settings.get('liq_threshold', 1000000)
+        if m: matches.append('liq')
+        res['liq_match'] = m
 
-    mode = settings.get('condition_mode', 'ANY')
-    is_triggered = False
+    # РЕЖИМ AND/OR
+    if settings.get('condition_mode') == 'ALL':
+        res['triggered'] = (len(matches) == len(active_filters)) and len(active_filters) > 0
+    else:
+        res['triggered'] = len(matches) > 0
 
-    if mode == 'ALL' and active_conditions:
-        is_triggered = len(matched_conditions) == len(active_conditions)
-    elif mode == 'ANY':
-        is_triggered = len(matched_conditions) > 0
-
-    return {'is_triggered': is_triggered, 'triggers': triggers, 'oi_change_pct': oi_change_pct}
+    return res
 
 
 @bot.message_handler(func=lambda msg: msg.text == "🧠 Автосигналы")
 def start_auto_signals(message):
     chat_id = message.chat.id
-    settings = user_settings.get(chat_id, {})
+    settings = user_settings[chat_id]
+
     if chat_id in active_monitors and active_monitors[chat_id]:
-        bot.send_message(chat_id, "Мониторинг уже запущен!")
+        bot.send_message(chat_id, "⚠️ Мониторинг уже запущен.")
         return
 
-    markets = get_all_markets()
+    all_targets = get_all_futures_symbols()
     active_monitors[chat_id] = True
-    bot.send_message(chat_id, f"🚀 Запущен мониторинг {len(markets)} пар (Binance + Bybit)!")
+    monitoring_progress[chat_id] = {'status': 'active', 'start_time': time.time(), 'scanned_coins': 0,
+                                    'total_coins': len(all_targets)}
+
+    bot.send_message(chat_id, f"🚀 Мониторинг {len(all_targets)} пар (Binance + Bybit) запущен!")
 
     def monitor():
         last_signal_time = {}
-        while active_monitors.get(chat_id, False):
-            interval_val = settings.get('interval', "15")
-            enable_liq = settings.get('enable_liq', True)
+        while active_monitors.get(chat_id):
+            try:
+                monitoring_progress[chat_id]['scanned_coins'] = 0
+                with ThreadPoolExecutor(max_workers=30) as executor:
+                    future_to_target = {
+                        executor.submit(analyze_market, t[0], t[1], settings['interval'], settings['enable_liq']): t for
+                        t in all_targets}
+                    for future in as_completed(future_to_target):
+                        if not active_monitors.get(chat_id): break
+                        data = future.result()
+                        monitoring_progress[chat_id]['scanned_coins'] += 1
+                        if not data: continue
 
-            with ThreadPoolExecutor(max_workers=15) as executor:
-                futures = {executor.submit(analyze_market, m['exchange'], m['symbol'], interval_val, enable_liq): m for
-                           m in markets}
-                for future in as_completed(futures):
-                    if not active_monitors.get(chat_id, False): break
-                    m = futures[future]
-                    analysis = future.result()
-                    if not analysis: continue
-
-                    cond = check_signal_conditions(analysis, settings, chat_id, m['exchange'], m['symbol'])
-                    if cond['is_triggered']:
-                        sym_key = f"{chat_id}_{m['exchange']}_{m['symbol']}"
-                        if time.time() - last_signal_time.get(sym_key, 0) < 300: continue
-                        last_signal_time[sym_key] = time.time()
-
-                        msg = (
-                            f"🚨 <b>Сигнал #{m['exchange']} {m['symbol']}</b>\n\n"
-                            f"✅ <b>Сработало:</b> {', '.join(cond['triggers'])}\n\n"
-                            f"💰 Цена: {analysis['price']:.6f}$ ({analysis['price_change']:+.2f}%)\n"
-                            f"📊 Объем: {analysis['volume']:,.0f}$ ({analysis['volume_change']:+.2f}%)\n"
-                            f"📈 OI: {analysis['oi']:,.0f}$ ({cond['oi_change_pct']:+.2f}%)\n"
-                        )
-                        if analysis['total_liq'] > 0:
-                            msg += f"💧 Ликв: {analysis['total_liq']:,.0f}$\n"
-                        bot.send_message(chat_id, msg, parse_mode='HTML')
-            time.sleep(60)
+                        cond = check_signal_conditions(data, settings, chat_id, data['symbol'])
+                        if cond['triggered']:
+                            key = f"{data['exchange']}_{data['symbol']}"
+                            if time.time() - last_signal_time.get(key, 0) > 300:
+                                last_signal_time[key] = time.time()
+                                msg = (
+                                    f"🚨 <b>СИГНАЛ: {data['exchange']}</b>\n"
+                                    f"🪙 Пара: <code>{data['symbol']}</code>\n"
+                                    f"💰 Цена: {data['price']:.4f} ({data['price_change']:+.2f}%)\n"
+                                    f"📊 Объем: {data['volume_change']:+.2f}%\n"
+                                    f"📈 OI: {cond['oi_change_pct']:+.2f}%\n"
+                                    f"💧 Ликв: {data['total_liq']:,.0f}$\n"
+                                    f"⏱ Интравал: {settings['interval']}м"
+                                )
+                                bot.send_message(chat_id, msg, parse_mode='HTML')
+                time.sleep(60)
+            except Exception as e:
+                logger.error(f"Error in monitor: {e}")
+                time.sleep(10)
 
     threading.Thread(target=monitor, daemon=True).start()
+
+
+@bot.message_handler(func=lambda msg: msg.text == "📡 Статус мониторинга")
+def status_btn(message):
+    cid = message.chat.id
+    if cid in monitoring_progress:
+        p = monitoring_progress[cid]
+        bot.send_message(cid, f"📡 <b>Статус:</b>\nОбработано: {p['scanned_coins']}/{p['total_coins']}",
+                         parse_mode='HTML')
+    else:
+        bot.send_message(cid, "❌ Не запущен")
 
 
 @bot.message_handler(commands=['stop'])
 def stop_command(message):
     active_monitors[message.chat.id] = False
-    bot.send_message(message.chat.id, "🛑 Мониторинг остановлен.", reply_markup=get_main_keyboard())
+    bot.send_message(message.chat.id, "🛑 Мониторинг остановлен")
+
+
+@bot.message_handler(commands=['debug'])
+def debug_command(message):
+    chat_id = message.chat.id
+    msg = f"🔧 Дебаг:\nАктивных пар: {len(get_all_futures_symbols())}\nТвой режим: {user_settings[chat_id].get('condition_mode', 'ANY')}"
+    bot.send_message(chat_id, msg)
 
 
 if __name__ == "__main__":
-    update_available_pairs(force_update=True)
+    logger.info("🚀 Бот запускается...")
+    get_available_futures_pairs(force_update=True)
     bot.infinity_polling()
