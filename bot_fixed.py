@@ -221,7 +221,6 @@ def get_bybit_kline(symbol="BTCUSDT", interval="15", limit=2):
 
         if data.get('retCode') == 0:
             kline_data = data['result']['list']
-            # Конвертируем в формат Binance для совместимости
             formatted_data = []
             for k in kline_data:
                 formatted_data.append([
@@ -233,7 +232,7 @@ def get_bybit_kline(symbol="BTCUSDT", interval="15", limit=2):
                     k[5],  # volume
                     k[6],  # quote volume
                 ])
-            formatted_data.reverse()  # Bybit возвращает в обратном порядке
+            formatted_data.reverse()
 
             with cache_lock:
                 data_cache[cache_key] = (formatted_data, current_time)
@@ -354,21 +353,28 @@ def get_bybit_ticker(symbol="BTCUSDT"):
 
 
 def get_binance_liquidations(symbol="BTCUSDT"):
-    """Получает данные о ликвидациях с Binance (исправлено)"""
+    """Получает данные о ликвидациях с Binance"""
     try:
         if not is_futures_pair_available(symbol, 'binance'):
             return 0.0, 0.0, 0.0
 
-        # Используем правильный endpoint для ликвидационных ордеров
+        end_time = int(time.time() * 1000)
+        start_time = end_time - 86400000  # 24 часа
+
         response = REQUEST_SESSION.get(
             f"{BINANCE_API_URL}/fapi/v1/forceOrders",
-            params={'symbol': symbol, 'limit': 100},
-            timeout=5,
+            params={
+                'symbol': symbol,
+                'startTime': start_time,
+                'endTime': end_time,
+                'limit': 1000
+            },
+            timeout=10,
             verify=True
         )
 
         if response.status_code == 400:
-            logger.debug(f"Пара {symbol} не поддерживает запрос ликвидаций")
+            logger.debug(f"Пара {symbol} не поддерживает запрос ликвидаций на Binance")
             return 0.0, 0.0, 0.0
 
         response.raise_for_status()
@@ -378,25 +384,26 @@ def get_binance_liquidations(symbol="BTCUSDT"):
         long_liq = 0.0
         short_liq = 0.0
 
-        if isinstance(liq_data, list):
-            # Фильтруем за последние 24 часа
-            time_threshold = int((time.time() - 86400) * 1000)
-
+        if isinstance(liq_data, list) and len(liq_data) > 0:
             for order in liq_data:
-                order_time = order.get('time', 0)
-                if order_time < time_threshold:
+                try:
+                    executed_qty = float(order.get('executedQty', 0))
+                    avg_price = float(order.get('avgPrice', 0))
+                    value = executed_qty * avg_price
+
+                    if order.get('side') == 'SELL':
+                        long_liq += value
+                    elif order.get('side') == 'BUY':
+                        short_liq += value
+                except (ValueError, TypeError):
                     continue
 
-                executed_qty = float(order.get('executedQty', 0))
-                avg_price = float(order.get('avgPrice', 0))
-                value = executed_qty * avg_price
-
-                if order.get('side') == 'SELL':
-                    long_liq += value
-                elif order.get('side') == 'BUY':
-                    short_liq += value
-
         total_liq = long_liq + short_liq
+
+        if total_liq > 0:
+            logger.info(
+                f"Binance ликвидации для {symbol}: total={total_liq:,.0f}$ (long={long_liq:,.0f}$, short={short_liq:,.0f}$)")
+
         return total_liq, long_liq, short_liq
 
     except requests.exceptions.RequestException as e:
@@ -411,44 +418,55 @@ def get_binance_liquidations(symbol="BTCUSDT"):
 
 
 def get_bybit_liquidations(symbol="BTCUSDT"):
-    """Получает данные о ликвидациях с Bybit (исправлено)"""
+    """Получает данные о ликвидациях с Bybit"""
     try:
         if not is_futures_pair_available(symbol, 'bybit'):
             return 0.0, 0.0, 0.0
 
+        end_time = int(time.time() * 1000)
+        start_time = end_time - 86400000  # 24 часа
+
         response = REQUEST_SESSION.get(
             f"{BYBIT_API_URL}/v5/market/liquidation",
-            params={'category': 'linear', 'symbol': symbol, 'limit': 100},
-            timeout=5,
+            params={
+                'category': 'linear',
+                'symbol': symbol,
+                'startTime': start_time,
+                'endTime': end_time,
+                'limit': 1000
+            },
+            timeout=10,
             verify=True
         )
-
-        if response.status_code == 400:
-            return 0.0, 0.0, 0.0
-
-        response.raise_for_status()
-        data = response.json()
-
-        if data.get('retCode') != 0:
-            return 0.0, 0.0, 0.0
 
         total_liq = 0.0
         long_liq = 0.0
         short_liq = 0.0
 
-        time_threshold = int((time.time() - 86400) * 1000)
-        for order in data['result']['list']:
-            order_time = int(order.get('updatedTime', 0))
-            if order_time < time_threshold:
-                continue
+        if response.status_code == 200:
+            data = response.json()
 
-            value = float(order['size']) * float(order['price'])
-            if order['side'] == 'Sell':
-                long_liq += value
-            elif order['side'] == 'Buy':
-                short_liq += value
+            if data.get('retCode') == 0 and data['result'].get('list'):
+                for order in data['result']['list']:
+                    try:
+                        size = float(order.get('size', 0))
+                        price = float(order.get('price', 0))
+                        value = size * price
+
+                        side = order.get('side', '').lower()
+                        if side == 'sell':
+                            long_liq += value
+                        elif side == 'buy':
+                            short_liq += value
+                    except (ValueError, TypeError):
+                        continue
 
         total_liq = long_liq + short_liq
+
+        if total_liq > 0:
+            logger.info(
+                f"Bybit ликвидации для {symbol}: total={total_liq:,.0f}$ (long={long_liq:,.0f}$, short={short_liq:,.0f}$)")
+
         return total_liq, long_liq, short_liq
 
     except Exception as e:
@@ -532,7 +550,6 @@ def get_all_futures_symbols():
     """Получаем все доступные фьючерсные пары с обеих бирж"""
     available_pairs = get_available_futures_pairs()
 
-    # Объединяем символы с обеих бирж
     all_symbols = set()
     for exchange_symbols in available_pairs.values():
         all_symbols.update(exchange_symbols)
@@ -616,7 +633,6 @@ def get_main_keyboard():
     return keyboard
 
 
-# Добавляем обработчик для новой кнопки
 @bot.message_handler(func=lambda msg: msg.text == "🔧 Режим")
 def signal_mode_settings(message):
     chat_id = message.chat.id
@@ -758,9 +774,7 @@ def check_signal_conditions(analysis, settings, chat_id, symbol, exchange):
     if enable_liq:
         liq_match = total_liq >= liq_threshold
 
-    # Проверяем условия в зависимости от режима триггера
     if trigger_mode == 'all':
-        # ALL режим - ВСЕ включенные условия должны сработать
         active_conditions = []
         if enable_price:
             active_conditions.append(price_match)
@@ -773,7 +787,6 @@ def check_signal_conditions(analysis, settings, chat_id, symbol, exchange):
 
         signal_triggered = all(active_conditions) if active_conditions else False
     else:
-        # ANY режим - любое условие
         signal_triggered = price_match or volume_match or oi_match or liq_match
 
     return {
@@ -793,7 +806,6 @@ def check_signal_conditions(analysis, settings, chat_id, symbol, exchange):
 def send_coin_glass_signal(signal_type: str, symbol: str, price: float, volume: float = None,
                            price_change: float = None, oi_change: float = None, exchange: str = None):
     if not COINGLASS_WEBHOOK_URL:
-        logger.warning("COINGLASS_WEBHOOK_URL не настроен в .env файле")
         return
 
     payload = {
@@ -874,11 +886,11 @@ def start_auto_signals(message):
     trigger_mode = settings.get('trigger_mode', 'any')
 
     status_msg = bot.send_message(chat_id, "🔄 Запуск мониторинга...")
-    time.sleep(1)
+    time.sleep(0.5)
     bot.edit_message_text("🔄 Запуск мониторинга... 🔄", chat_id, status_msg.message_id)
-    time.sleep(1)
+    time.sleep(0.5)
     bot.edit_message_text("🔄 Запуск мониторинга... 🔄 ✅", chat_id, status_msg.message_id)
-    time.sleep(1)
+    time.sleep(0.5)
 
     bot.send_message(
         chat_id,
@@ -890,9 +902,9 @@ def start_auto_signals(message):
         f"• Режим триггеров: {'ALL (все условия)' if trigger_mode == 'all' else 'ANY (любой)'}\n"
         f"• Включенные параметры: {sum([settings.get('enable_price', True), settings.get('enable_volume', True), settings.get('enable_oi', True), settings.get('enable_liq', True)])}/4\n\n"
         f"📈 <b>Что делать дальше:</b>\n"
-        f"1. Отслеживайте прогресс через 📡 Статус мониторинга\n"
+        f"1. Отслеживайте прогресс через 📡 Статус\n"
         f"2. Вы получите уведомления при срабатывании условий\n"
-        f"3. Используйте /stop для остановки мониторинга",
+        f"3. Используйте 🛑 Остановить для остановки мониторинга",
         parse_mode='HTML'
     )
 
@@ -1009,6 +1021,7 @@ def start_auto_signals(message):
 
                     exchange_emoji = "🟡" if exchange == "Binance" else "🔵"
 
+                    # ФОРМИРУЕМ СООБЩЕНИЕ СИГНАЛА
                     msg_lines = [
                         f"🚨 <b>Сигнал #{count} | {symbol}</b>",
                         f"{exchange_emoji} <b>Биржа: {exchange}</b>",
@@ -1029,6 +1042,7 @@ def start_auto_signals(message):
                         triggers.append(f"💧 Ликвидации: {total_liq:,.0f}$")
 
                     mode_text = "ALL" if conditions['trigger_mode'] == 'all' else "ANY"
+
                     if triggers:
                         msg_lines.append(f"✅ <b>Сработало ({mode_text}):</b>")
                         for t in triggers:
@@ -1040,7 +1054,6 @@ def start_auto_signals(message):
                     msg_lines.append(f"📈 <b>OI:</b> {oi:,.0f}$ ({conditions['oi_change_pct']:+.2f}%)")
                     msg_lines.append("")
 
-                    # Ликвидации всегда показываем
                     if total_liq > 0:
                         msg_lines.append(f"💧 <b>Ликвидации (24ч):</b> {total_liq:,.0f}$")
                         msg_lines.append(f"  🟢 Long: {analysis['long_liq']:,.0f}$")
@@ -1056,12 +1069,22 @@ def start_auto_signals(message):
                         coinglass_url = f"https://www.coinglass.com/tv/Bybit_{symbol}"
                     else:
                         coinglass_url = f"https://www.coinglass.com/tv/Binance_{symbol}"
+
                     msg_lines.append(f"🔗 {coinglass_url}")
 
                     msg = "\n".join(msg_lines)
 
                     logger.info(f"Отправка сигнала для {symbol} ({exchange}) в чат {chat_id}")
-                    bot.send_message(chat_id, msg, parse_mode='HTML')
+
+                    try:
+                        bot.send_message(chat_id, msg, parse_mode='HTML')
+                        logger.info(f"✅ Сигнал успешно отправлен для {symbol}")
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка отправки сигнала: {e}")
+                        try:
+                            bot.send_message(chat_id, msg.replace('<b>', '').replace('</b>', ''))
+                        except:
+                            pass
 
                     if conditions['price_match'] and settings.get('enable_price', True):
                         send_coin_glass_signal(
@@ -1207,6 +1230,7 @@ def stop_command(message):
     bot.send_message(chat_id, "🛑 Остановка мониторинга... Подождите несколько секунд.",
                      reply_markup=get_main_keyboard())
 
+
 @bot.message_handler(func=lambda msg: msg.text == "🛑 Остановить")
 def stop_btn(message):
     stop_command(message)
@@ -1335,7 +1359,6 @@ def test_conditions_command(message):
         if settings.get('enable_liq', True):
             liq_match = scenario['liq_amount'] >= settings.get('liq_threshold', 1000000)
 
-        # Применяем режим триггеров
         if trigger_mode == 'all':
             active_conditions = []
             if settings.get('enable_price', True):
@@ -1433,7 +1456,6 @@ def help_command(message):
     bot.send_message(message.chat.id, help_msg, parse_mode='HTML')
 
 
-# Копируем остальные обработчики из оригинального кода
 @bot.message_handler(func=lambda msg: msg.text == "ℹ️ Помощь")
 def help_btn(message):
     help_command(message)
@@ -1517,7 +1539,6 @@ def scan_btn(message):
 
 @bot.message_handler(func=lambda msg: msg.text == "⚙️ Настройки")
 def setup_signals(message):
-    # Копируем оригинальную функцию
     chat_id = message.chat.id
     if chat_id not in user_settings:
         user_settings[chat_id] = {
@@ -1566,7 +1587,6 @@ def get_settings_keyboard():
     return keyboard
 
 
-# Копируем остальные обработчики настроек
 @bot.message_handler(func=lambda msg: msg.text in [
     "💰 Порог цены",
     "📊 Порог объема",
@@ -1740,7 +1760,7 @@ def save_settings(message):
         "🚀 <b>Что дальше:</b>\n"
         "1. Нажмите 🚀 Запустить для запуска мониторинга\n"
         "2. Используйте /test_conditions для проверки настроек\n"
-        "3. Отслеживайте прогресс через 📡 Статус мониторинга\n"
+        "3. Отслеживайте прогресс через 📡 Статус\n"
         "4. При необходимости настройте параметры заново"
     )
 
