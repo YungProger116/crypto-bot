@@ -1009,8 +1009,11 @@ def start_auto_signals(message):
 
                     exchange_emoji = "🟡" if exchange == "Binance" else "🔵"
 
-                    msg_lines = [f"🚨 <b>Сигнал #{count} по {symbol}!</b>"]
-                    msg_lines.append(f"{exchange_emoji} <b>Биржа: {exchange}</b>\n")
+                    msg_lines = [
+                        f"🚨 <b>Сигнал #{count} | {symbol}</b>",
+                        f"{exchange_emoji} <b>Биржа: {exchange}</b>",
+                        ""
+                    ]
 
                     triggers = []
                     if conditions['price_match']:
@@ -1026,19 +1029,25 @@ def start_auto_signals(message):
                         triggers.append(f"💧 Ликвидации: {total_liq:,.0f}$")
 
                     mode_text = "ALL" if conditions['trigger_mode'] == 'all' else "ANY"
-
                     if triggers:
-                        msg_lines.append(f"✅ <b>Сработало ({mode_text}):</b> " + ", ".join(triggers))
+                        msg_lines.append(f"✅ <b>Сработало ({mode_text}):</b>")
+                        for t in triggers:
+                            msg_lines.append(f"  • {t}")
+                        msg_lines.append("")
 
-                    msg_lines.append("")
                     msg_lines.append(f"💰 <b>Цена:</b> {price:.6f}$ ({price_change:+.2f}%)")
                     msg_lines.append(f"📊 <b>Объем:</b> {volume:,.0f}$ ({volume_change:+.2f}%)")
                     msg_lines.append(f"📈 <b>OI:</b> {oi:,.0f}$ ({conditions['oi_change_pct']:+.2f}%)")
+                    msg_lines.append("")
 
-                    liq_str = f"{total_liq:,.0f}$" if total_liq > 0 else "нет данных"
-                    long_str = f"{analysis['long_liq']:,.0f}$" if total_liq > 0 else "—"
-                    short_str = f"{analysis['short_liq']:,.0f}$" if total_liq > 0 else "—"
-                    msg_lines.append(f"💧 <b>Ликвидации:</b> {liq_str} (🟢 Long: {long_str} / 🔴 Short: {short_str})")
+                    # Ликвидации всегда показываем
+                    if total_liq > 0:
+                        msg_lines.append(f"💧 <b>Ликвидации (24ч):</b> {total_liq:,.0f}$")
+                        msg_lines.append(f"  🟢 Long: {analysis['long_liq']:,.0f}$")
+                        msg_lines.append(f"  🔴 Short: {analysis['short_liq']:,.0f}$")
+                    else:
+                        msg_lines.append(f"💧 <b>Ликвидации:</b> нет данных")
+                    msg_lines.append("")
 
                     msg_lines.append(f"⏱ <b>Интервал:</b> {readable_interval}")
                     msg_lines.append(f"🕒 <b>Время:</b> {update_time} UTC")
@@ -1047,8 +1056,7 @@ def start_auto_signals(message):
                         coinglass_url = f"https://www.coinglass.com/tv/Bybit_{symbol}"
                     else:
                         coinglass_url = f"https://www.coinglass.com/tv/Binance_{symbol}"
-
-                    msg_lines.append(f"🔗 <b>Подробнее:</b> {coinglass_url}")
+                    msg_lines.append(f"🔗 {coinglass_url}")
 
                     msg = "\n".join(msg_lines)
 
@@ -1547,17 +1555,14 @@ def setup_signals(message):
 
 
 def get_settings_keyboard():
-    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    buttons = [
-        "💰 Порог цены",        "🔔 Вкл/Выкл Цену",
-        "📊 Порог объема",      "🔔 Вкл/Выкл Объем",
-        "📈 Порог OI",          "🔔 Вкл/Выкл OI",
-        "💧 Порог ликвидаций",  "🔔 Вкл/Выкл Ликвидации",
-        "⏱ Интервал анализа",
-        "✅ Сохранить настройки",
-        "↩️ Назад"
-    ]
-    keyboard.add(*buttons)
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    keyboard.row("💰 Порог цены", "🔔 Вкл/Выкл Цену")
+    keyboard.row("📊 Порог объема", "🔔 Вкл/Выкл Объем")
+    keyboard.row("📈 Порог OI", "🔔 Вкл/Выкл OI")
+    keyboard.row("💧 Порог ликвидаций", "🔔 Вкл/Выкл Ликвидации")
+    keyboard.row("⏱ Интервал анализа")
+    keyboard.row("✅ Сохранить настройки")
+    keyboard.row("↩️ Назад")
     return keyboard
 
 
