@@ -342,7 +342,7 @@ def get_bybit_ticker(symbol="BTCUSDT"):
             'volume': float(ticker['volume24h']),
             'quote_volume': float(ticker['turnover24h']),
             'oi': oi_value,
-            'timestamp': int(ticker['time'])
+            'timestamp': int(ticker_data.get('time', int(time.time() * 1000)))
         }
 
         with cache_lock:
