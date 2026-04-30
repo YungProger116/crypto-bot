@@ -1019,7 +1019,7 @@ def start_auto_signals(message):
                     interval_key = SUPPORTED_INTERVALS.get(signal_data['interval_val'], "15m")
                     readable_interval = INTERVAL_READABLE.get(interval_key, interval_key)
 
-                    exchange_emoji = "🟡" if exchange == "Binance" else "🔵"
+                    exchange_emoji = "🟡" if exchange == "Binance" else "⚫️"
 
                     # ФОРМИРУЕМ СООБЩЕНИЕ СИГНАЛА
                     msg_lines = [
@@ -1502,7 +1502,7 @@ def scan_btn(message):
     if analyses:
         for analysis in analyses:
             update_time = datetime.fromtimestamp(analysis['timestamp'] / 1000).strftime('%H:%M:%S')
-            exchange_emoji = "🟡" if analysis['exchange'] == "Binance" else "🔵"
+            exchange_emoji = "🟡" if analysis['exchange'] == "Binance" else "⚫️"
 
             if analysis['total_liq'] > 0:
                 liq_info = (
