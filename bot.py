@@ -1036,8 +1036,10 @@ def start_auto_signals(message):
                     msg_lines.append(f"📊 <b>Объем:</b> {volume:,.0f}$ ({volume_change:+.2f}%)")
                     msg_lines.append(f"📈 <b>OI:</b> {oi:,.0f}$ ({conditions['oi_change_pct']:+.2f}%)")
 
-                    if total_liq > 0:
-                        msg_lines.append(f"💧 <b>Ликвидации:</b> {total_liq:,.0f}$")
+                    liq_str = f"{total_liq:,.0f}$" if total_liq > 0 else "нет данных"
+                    long_str = f"{analysis['long_liq']:,.0f}$" if total_liq > 0 else "—"
+                    short_str = f"{analysis['short_liq']:,.0f}$" if total_liq > 0 else "—"
+                    msg_lines.append(f"💧 <b>Ликвидации:</b> {liq_str} (🟢 Long: {long_str} / 🔴 Short: {short_str})")
 
                     msg_lines.append(f"⏱ <b>Интервал:</b> {readable_interval}")
                     msg_lines.append(f"🕒 <b>Время:</b> {update_time} UTC")
