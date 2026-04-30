@@ -584,11 +584,11 @@ def send_welcome(message):
         "• Режимы ANY (любой триггер) или ALL (все триггеры)\n"
         "• Параллельная обработка данных\n\n"
         "⚡️ <b>Быстрый старт:</b>\n"
-        "1. Нажмите ⚙ Настроить сигналы\n"
+        "1. Нажмите ⚙️ Настройки\n"
         "2. Установите пороги срабатывания\n"
-        "3. Настройте режим триггеров и биржи\n"
+        "3. Настройте режим через 🔧 Режим\n"
         "4. Сохраните настройки ✅\n"
-        "5. Запустите 🧠 Автосигналы\n\n"
+        "5. Нажмите 🚀 Запустить\n\n"
         "📈 <b>Рекомендуемые настройки:</b>\n"
         "• Цена: 1.5%\n• Объем: 50%\n• OI: 5%\n• Ликвидации: 1,000,000$\n"
         "• Интервал: 15 минут\n\n"
@@ -605,12 +605,11 @@ def send_welcome(message):
 def get_main_keyboard():
     keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     buttons = [
-        "📈 Цена BTC",
-        "🔍 Анализ BTC",
-        "🧠 Автосигналы",
-        "📡 Статус мониторинга",
-        "⚙ Настроить сигналы",
-        "🔧 Режим сигналов",
+        "🚀 Запустить",
+        "🛑 Остановить",
+        "📡 Статус",
+        "⚙️ Настройки",
+        "🔧 Режим",
         "ℹ️ Помощь"
     ]
     keyboard.add(*buttons)
@@ -618,7 +617,7 @@ def get_main_keyboard():
 
 
 # Добавляем обработчик для новой кнопки
-@bot.message_handler(func=lambda msg: msg.text == "🔧 Режим сигналов")
+@bot.message_handler(func=lambda msg: msg.text == "🔧 Режим")
 def signal_mode_settings(message):
     chat_id = message.chat.id
 
@@ -828,7 +827,7 @@ def send_coin_glass_signal(signal_type: str, symbol: str, price: float, volume: 
         logger.error(f"⚠️ Ошибка при отправке в CoinGlass: {e}")
 
 
-@bot.message_handler(func=lambda msg: msg.text == "🧠 Автосигналы")
+@bot.message_handler(func=lambda msg: msg.text == "🚀 Запустить")
 def start_auto_signals(message):
     chat_id = message.chat.id
     settings = user_settings.get(chat_id, {})
@@ -1186,7 +1185,7 @@ def get_monitoring_progress(chat_id):
     )
 
 
-@bot.message_handler(func=lambda msg: msg.text == "📡 Статус мониторинга")
+@bot.message_handler(func=lambda msg: msg.text == "📡 Статус")
 def status_btn(message):
     chat_id = message.chat.id
     status_msg = get_monitoring_progress(chat_id)
@@ -1199,6 +1198,10 @@ def stop_command(message):
     stop_monitor(chat_id)
     bot.send_message(chat_id, "🛑 Остановка мониторинга... Подождите несколько секунд.",
                      reply_markup=get_main_keyboard())
+
+@bot.message_handler(func=lambda msg: msg.text == "🛑 Остановить")
+def stop_btn(message):
+    stop_command(message)
 
 
 @bot.message_handler(commands=['status'])
@@ -1407,12 +1410,11 @@ def help_command(message):
         "/test_conditions - Тест текущих настроек\n"
         "/clear_cache - Очистить кэш данных\n\n"
         "📊 <b>Основные кнопки:</b>\n"
-        "📈 Цена BTC - Текущая цена BTC\n"
-        "🔍 Анализ BTC - Подробный анализ BTC\n"
-        "🧠 Автосигналы - Запуск мониторинга\n"
-        "📡 Статус мониторинга - Прогресс сканирования\n"
-        "⚙ Настроить сигналы - Настройка параметров\n"
-        "🔧 Режим сигналов - Настройка триггеров и бирж\n"
+        "🚀 Запустить - Запуск мониторинга\n"
+        "🛑 Остановить - Остановка мониторинга\n"
+        "📡 Статус - Прогресс сканирования\n"
+        "⚙️ Настройки - Настройка параметров\n"
+        "🔧 Режим - Настройка триггеров и бирж\n"
         "ℹ️ Помощь - Информация о боте\n\n"
         "💡 <b>Новые функции:</b>\n"
         "• Поддержка Binance + Bybit\n"
@@ -1505,7 +1507,7 @@ def scan_btn(message):
         bot.edit_message_text("❌ Не удалось получить данные для анализа BTC", chat_id, status_msg.message_id)
 
 
-@bot.message_handler(func=lambda msg: msg.text == "⚙ Настроить сигналы")
+@bot.message_handler(func=lambda msg: msg.text == "⚙️ Настройки")
 def setup_signals(message):
     # Копируем оригинальную функцию
     chat_id = message.chat.id
@@ -1735,7 +1737,7 @@ def save_settings(message):
         f"💧 Порог ликвидаций: <b>{settings.get('liq_threshold', 1000000):,.0f}$</b>\n"
         f"⏱ Интервал анализа: <b>{interval_name}</b>\n\n"
         "🚀 <b>Что дальше:</b>\n"
-        "1. Нажмите 🧠 Автосигналы для запуска мониторинга\n"
+        "1. Нажмите 🚀 Запустить для запуска мониторинга\n"
         "2. Используйте /test_conditions для проверки настроек\n"
         "3. Отслеживайте прогресс через 📡 Статус мониторинга\n"
         "4. При необходимости настройте параметры заново"
