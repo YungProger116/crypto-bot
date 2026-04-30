@@ -15,6 +15,7 @@ import random
 import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib3
+import asyncio
 
 # Отключение предупреждений о небезопасных запросах
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -40,6 +41,171 @@ if not TOKEN:
 AVAILABLE_FUTURES_PAIRS = {}
 LAST_FUTURES_UPDATE = 0
 FUTURES_UPDATE_INTERVAL = 3600  # 1 час
+
+# ========== WEBSOCKET КОЛЛЕКТОР ЛИКВИДАЦИЙ ==========
+ws_liquidation_data = defaultdict(lambda: {'long': 0.0, 'short': 0.0, 'total': 0.0, 'last_update': 0})
+ws_lock = threading.Lock()
+ws_running = False
+
+
+def get_ws_liquidations(symbol, exchange='binance'):
+    """Получает накопленные ликвидации из WebSocket коллектора"""
+    with ws_lock:
+        key = f"{exchange}_{symbol}"
+        data = ws_liquidation_data.get(key, {'long': 0.0, 'short': 0.0, 'total': 0.0})
+        # Очищаем данные старше 24 часов
+        if time.time() - data['last_update'] > 86400:
+            ws_liquidation_data[key] = {'long': 0.0, 'short': 0.0, 'total': 0.0, 'last_update': 0}
+            return 0.0, 0.0, 0.0
+        return data['total'], data['long'], data['short']
+
+
+async def binance_ws_listener():
+    """Слушает ликвидации Binance через WebSocket"""
+    uri = "wss://fstream.binance.com/ws/!forceOrder@arr"
+
+    while ws_running:
+        try:
+            async with websockets.connect(uri) as websocket:
+                logger.info("🔌 Подключен к Binance WebSocket (ликвидации)")
+
+                while ws_running:
+                    try:
+                        msg = await asyncio.wait_for(websocket.recv(), timeout=30)
+                        data = json.loads(msg)
+
+                        if 'o' in data and data['o'].get('e') == 'forceOrder':
+                            order = data['o']
+                            symbol = order['s']
+                            side = order['S']  # SELL или BUY
+                            qty = float(order['q'])
+                            price = float(order['p'])
+                            value = qty * price
+
+                            with ws_lock:
+                                key = f"binance_{symbol}"
+                                current = ws_liquidation_data[key]
+
+                                if side == 'SELL':
+                                    current['long'] += value
+                                else:  # BUY
+                                    current['short'] += value
+
+                                current['total'] = current['long'] + current['short']
+                                current['last_update'] = time.time()
+
+                    except asyncio.TimeoutError:
+                        continue
+                    except Exception as e:
+                        logger.error(f"Binance WS ошибка: {e}")
+                        break
+
+        except Exception as e:
+            logger.error(f"Binance WS переподключение: {e}")
+            await asyncio.sleep(5)
+
+
+async def bybit_ws_listener():
+    """Слушает ликвидации Bybit через WebSocket"""
+    uri = "wss://stream.bybit.com/v5/public/linear"
+
+    while ws_running:
+        try:
+            async with websockets.connect(uri) as websocket:
+                # Подписываемся на ликвидации
+                subscribe_msg = json.dumps({
+                    "op": "subscribe",
+                    "args": ["liquidation"]
+                })
+                await websocket.send(subscribe_msg)
+                logger.info("🔌 Подключен к Bybit WebSocket (ликвидации)")
+
+                while ws_running:
+                    try:
+                        msg = await asyncio.wait_for(websocket.recv(), timeout=30)
+                        data = json.loads(msg)
+
+                        if 'topic' in data and data['topic'] == 'liquidation':
+                            order = data['data']
+                            symbol = order['symbol']
+                            side = order['side']  # Buy или Sell
+                            qty = float(order['size'])
+                            price = float(order['price'])
+                            value = qty * price
+
+                            with ws_lock:
+                                key = f"bybit_{symbol}"
+                                current = ws_liquidation_data[key]
+
+                                if side == 'Sell':
+                                    current['long'] += value
+                                else:  # Buy
+                                    current['short'] += value
+
+                                current['total'] = current['long'] + current['short']
+                                current['last_update'] = time.time()
+
+                    except asyncio.TimeoutError:
+                        continue
+                    except Exception as e:
+                        logger.error(f"Bybit WS ошибка: {e}")
+                        break
+
+        except Exception as e:
+            logger.error(f"Bybit WS переподключение: {e}")
+            await asyncio.sleep(5)
+
+
+async def run_ws_collectors():
+    """Запускает оба WebSocket коллектора"""
+    await asyncio.gather(
+        binance_ws_listener(),
+        bybit_ws_listener()
+    )
+
+
+def start_ws_collectors():
+    """Запускает WebSocket коллекторы в отдельном потоке"""
+    global ws_running
+    ws_running = True
+
+    def run_async_loop():
+        asyncio.run(run_ws_collectors())
+
+    ws_thread = threading.Thread(target=run_async_loop, daemon=True)
+    ws_thread.start()
+    logger.info("🚀 WebSocket коллекторы ликвидаций запущены")
+
+
+def stop_ws_collectors():
+    """Останавливает WebSocket коллекторы"""
+    global ws_running
+    ws_running = False
+    logger.info("🛑 WebSocket коллекторы остановлены")
+
+
+def cleanup_old_ws_data():
+    """Очищает старые данные ликвидаций"""
+    while True:
+        time.sleep(3600)  # Проверяем каждый час
+        with ws_lock:
+            current_time = time.time()
+            keys_to_delete = []
+            for key, data in ws_liquidation_data.items():
+                if current_time - data['last_update'] > 86400:  # 24 часа
+                    keys_to_delete.append(key)
+            for key in keys_to_delete:
+                del ws_liquidation_data[key]
+            if keys_to_delete:
+                logger.info(f"Очищено {len(keys_to_delete)} устаревших записей ликвидаций")
+
+
+# Запускаем очистку в отдельном потоке
+cleanup_thread = threading.Thread(target=cleanup_old_ws_data, daemon=True)
+cleanup_thread.start()
+
+
+# ========== КОНЕЦ WEBSOCKET КОЛЛЕКТОРА ==========
 
 
 # Создание сессии с повторными попытками
@@ -224,13 +390,13 @@ def get_bybit_kline(symbol="BTCUSDT", interval="15", limit=2):
             formatted_data = []
             for k in kline_data:
                 formatted_data.append([
-                    int(k[0]),  # timestamp
-                    k[1],  # open
-                    k[2],  # high
-                    k[3],  # low
-                    k[4],  # close
-                    k[5],  # volume
-                    k[6],  # quote volume
+                    int(k[0]),
+                    k[1],
+                    k[2],
+                    k[3],
+                    k[4],
+                    k[5],
+                    k[6],
                 ])
             formatted_data.reverse()
 
@@ -352,128 +518,6 @@ def get_bybit_ticker(symbol="BTCUSDT"):
         return None
 
 
-def get_binance_liquidations(symbol="BTCUSDT"):
-    """Получает данные о ликвидациях с Binance"""
-    try:
-        if not is_futures_pair_available(symbol, 'binance'):
-            return 0.0, 0.0, 0.0
-
-        end_time = int(time.time() * 1000)
-        start_time = end_time - 86400000  # 24 часа
-
-        response = REQUEST_SESSION.get(
-            f"{BINANCE_API_URL}/fapi/v1/forceOrders",
-            params={
-                'symbol': symbol,
-                'startTime': start_time,
-                'endTime': end_time,
-                'limit': 1000
-            },
-            timeout=10,
-            verify=True
-        )
-
-        if response.status_code == 400:
-            logger.debug(f"Пара {symbol} не поддерживает запрос ликвидаций на Binance")
-            return 0.0, 0.0, 0.0
-
-        response.raise_for_status()
-        liq_data = response.json()
-
-        total_liq = 0.0
-        long_liq = 0.0
-        short_liq = 0.0
-
-        if isinstance(liq_data, list) and len(liq_data) > 0:
-            for order in liq_data:
-                try:
-                    executed_qty = float(order.get('executedQty', 0))
-                    avg_price = float(order.get('avgPrice', 0))
-                    value = executed_qty * avg_price
-
-                    if order.get('side') == 'SELL':
-                        long_liq += value
-                    elif order.get('side') == 'BUY':
-                        short_liq += value
-                except (ValueError, TypeError):
-                    continue
-
-        total_liq = long_liq + short_liq
-
-        if total_liq > 0:
-            logger.info(
-                f"Binance ликвидации для {symbol}: total={total_liq:,.0f}$ (long={long_liq:,.0f}$, short={short_liq:,.0f}$)")
-
-        return total_liq, long_liq, short_liq
-
-    except requests.exceptions.RequestException as e:
-        if hasattr(e, 'response') and e.response is not None and e.response.status_code == 400:
-            logger.debug(f"Пара {symbol} не поддерживает запрос ликвидаций: 400 Bad Request")
-        else:
-            logger.debug(f"Ошибка запроса ликвидаций для {symbol}: {str(e)}")
-        return 0.0, 0.0, 0.0
-    except Exception as e:
-        logger.debug(f"Неизвестная ошибка при запросе ликвидаций для {symbol}: {str(e)}")
-        return 0.0, 0.0, 0.0
-
-
-def get_bybit_liquidations(symbol="BTCUSDT"):
-    """Получает данные о ликвидациях с Bybit"""
-    try:
-        if not is_futures_pair_available(symbol, 'bybit'):
-            return 0.0, 0.0, 0.0
-
-        end_time = int(time.time() * 1000)
-        start_time = end_time - 86400000  # 24 часа
-
-        response = REQUEST_SESSION.get(
-            f"{BYBIT_API_URL}/v5/market/liquidation",
-            params={
-                'category': 'linear',
-                'symbol': symbol,
-                'startTime': start_time,
-                'endTime': end_time,
-                'limit': 1000
-            },
-            timeout=10,
-            verify=True
-        )
-
-        total_liq = 0.0
-        long_liq = 0.0
-        short_liq = 0.0
-
-        if response.status_code == 200:
-            data = response.json()
-
-            if data.get('retCode') == 0 and data['result'].get('list'):
-                for order in data['result']['list']:
-                    try:
-                        size = float(order.get('size', 0))
-                        price = float(order.get('price', 0))
-                        value = size * price
-
-                        side = order.get('side', '').lower()
-                        if side == 'sell':
-                            long_liq += value
-                        elif side == 'buy':
-                            short_liq += value
-                    except (ValueError, TypeError):
-                        continue
-
-        total_liq = long_liq + short_liq
-
-        if total_liq > 0:
-            logger.info(
-                f"Bybit ликвидации для {symbol}: total={total_liq:,.0f}$ (long={long_liq:,.0f}$, short={short_liq:,.0f}$)")
-
-        return total_liq, long_liq, short_liq
-
-    except Exception as e:
-        logger.debug(f"Ошибка запроса ликвидаций Bybit для {symbol}: {str(e)}")
-        return 0.0, 0.0, 0.0
-
-
 def analyze_market(symbol, interval="15", enable_liq=False, exchanges=['binance', 'bybit']):
     """Анализирует рынок на указанных биржах"""
     results = []
@@ -523,10 +567,8 @@ def process_market_data(ticker_data, kline_data, exchange, enable_liq):
 
         total_liq, long_liq, short_liq = 0.0, 0.0, 0.0
         if enable_liq:
-            if exchange == 'binance':
-                total_liq, long_liq, short_liq = get_binance_liquidations(ticker_data['symbol'])
-            elif exchange == 'bybit':
-                total_liq, long_liq, short_liq = get_bybit_liquidations(ticker_data['symbol'])
+            # Используем WebSocket данные
+            total_liq, long_liq, short_liq = get_ws_liquidations(ticker_data['symbol'], exchange)
 
         return {
             'symbol': ticker_data['symbol'],
@@ -599,7 +641,7 @@ def send_welcome(message):
         "• Мониторинг фьючерсных пар Binance + Bybit\n"
         "• Настраиваемые сигналы по цене, объему, OI и ликвидациям\n"
         "• Режимы ANY (любой триггер) или ALL (все триггеры)\n"
-        "• Параллельная обработка данных\n\n"
+        "• Ликвидации через WebSocket (реальное время)\n\n"
         "⚡️ <b>Быстрый старт:</b>\n"
         "1. Нажмите ⚙️ Настройки\n"
         "2. Установите пороги срабатывания\n"
@@ -614,7 +656,8 @@ def send_welcome(message):
         "/debug - Отладка\n"
         "/test_conditions - Тест настроек\n"
         "/clear_cache - Очистить кэш\n"
-        "/help - Помощь"
+        "/help - Помощь\n"
+        "/liq_stats - Статистика WebSocket ликвидаций"
     )
     bot.send_message(chat_id, welcome_msg, parse_mode='HTML', reply_markup=get_main_keyboard())
 
@@ -631,6 +674,33 @@ def get_main_keyboard():
     ]
     keyboard.add(*buttons)
     return keyboard
+
+
+@bot.message_handler(commands=['liq_stats'])
+def liq_stats_command(message):
+    """Показывает статистику WebSocket ликвидаций"""
+    chat_id = message.chat.id
+
+    with ws_lock:
+        total_pairs = len(ws_liquidation_data)
+        total_liq = sum(d['total'] for d in ws_liquidation_data.values())
+
+        # Топ-5 по ликвидациям
+        sorted_pairs = sorted(ws_liquidation_data.items(), key=lambda x: x[1]['total'], reverse=True)[:5]
+
+        msg = f"📊 <b>WebSocket статистика ликвидаций</b>\n\n"
+        msg += f"🔌 Статус: {'✅ Активен' if ws_running else '❌ Остановлен'}\n"
+        msg += f"📈 Всего пар с данными: {total_pairs}\n"
+        msg += f"💰 Общая сумма ликвидаций: {total_liq:,.0f}$\n\n"
+
+        if sorted_pairs:
+            msg += "<b>Топ-5 по ликвидациям:</b>\n"
+            for key, data in sorted_pairs:
+                exchange, symbol = key.split('_', 1)
+                emoji = "🟡" if exchange == "binance" else "⚫️"
+                msg += f"{emoji} {symbol}: {data['total']:,.0f}$ (L:{data['long']:,.0f} / S:{data['short']:,.0f})\n"
+
+    bot.send_message(chat_id, msg, parse_mode='HTML')
 
 
 @bot.message_handler(func=lambda msg: msg.text == "🔧 Режим")
@@ -900,7 +970,8 @@ def start_auto_signals(message):
         f"• Биржи: {', '.join([e.capitalize() for e in exchanges])}\n"
         f"• Интервал: {INTERVAL_READABLE.get(SUPPORTED_INTERVALS.get(settings.get('interval', '15'), '15m'), '15 минут')}\n"
         f"• Режим триггеров: {'ALL (все условия)' if trigger_mode == 'all' else 'ANY (любой)'}\n"
-        f"• Включенные параметры: {sum([settings.get('enable_price', True), settings.get('enable_volume', True), settings.get('enable_oi', True), settings.get('enable_liq', True)])}/4\n\n"
+        f"• Включенные параметры: {sum([settings.get('enable_price', True), settings.get('enable_volume', True), settings.get('enable_oi', True), settings.get('enable_liq', True)])}/4\n"
+        f"• Ликвидации: WebSocket (реальное время)\n\n"
         f"📈 <b>Что делать дальше:</b>\n"
         f"1. Отслеживайте прогресс через 📡 Статус\n"
         f"2. Вы получите уведомления при срабатывании условий\n"
@@ -1055,11 +1126,11 @@ def start_auto_signals(message):
                     msg_lines.append("")
 
                     if total_liq > 0:
-                        msg_lines.append(f"💧 <b>Ликвидации (24ч):</b> {total_liq:,.0f}$")
+                        msg_lines.append(f"💧 <b>Ликвидации (24ч WS):</b> {total_liq:,.0f}$")
                         msg_lines.append(f"  🟢 Long: {analysis['long_liq']:,.0f}$")
                         msg_lines.append(f"  🔴 Short: {analysis['short_liq']:,.0f}$")
                     else:
-                        msg_lines.append(f"💧 <b>Ликвидации:</b> нет данных")
+                        msg_lines.append(f"💧 <b>Ликвидации:</b> ожидание данных...")
                     msg_lines.append("")
 
                     msg_lines.append(f"⏱ <b>Интервал:</b> {readable_interval}")
@@ -1203,6 +1274,11 @@ def get_monitoring_progress(chat_id):
     exchanges = settings.get('exchanges', ['binance', 'bybit'])
     trigger_mode = settings.get('trigger_mode', 'any')
 
+    # Статистика WebSocket
+    with ws_lock:
+        ws_pairs = len(ws_liquidation_data)
+        ws_total = sum(d['total'] for d in ws_liquidation_data.values())
+
     return (
         f"📡 <b>Статус мониторинга: АКТИВЕН</b>\n\n"
         f"⏱ Время работы: {elapsed_min} мин {elapsed_sec} сек\n"
@@ -1211,6 +1287,7 @@ def get_monitoring_progress(chat_id):
         f"🔢 Прогресс: {scanned_coins}/{total_coins} монет\n"
         f"📊 Завершено: {progress_percent:.1f}%\n"
         f"{progress_bar}\n\n"
+        f"💧 WS ликвидаций: {ws_total:,.0f}$ ({ws_pairs} пар)\n\n"
         f"⏳ Осталось: ~{remaining_min} мин {remaining_sec} сек\n"
         f"🔄 Следующая проверка: через {int(progress.get('next_check', 0))} сек"
     )
@@ -1271,6 +1348,11 @@ def debug_command(message):
         oi_keys = [k for k in prev_oi_data.keys() if k.startswith(f"{chat_id}_")]
         oi_count = len(oi_keys)
 
+    # WebSocket статистика
+    with ws_lock:
+        ws_pairs = len(ws_liquidation_data)
+        ws_total = sum(d['total'] for d in ws_liquidation_data.values())
+
     settings_info = []
     for key, value in settings.items():
         if key == 'interval':
@@ -1300,6 +1382,10 @@ def debug_command(message):
         f"• Binance пар: {len(available_pairs.get('binance', set()))}\n"
         f"• Bybit пар: {len(available_pairs.get('bybit', set()))}\n"
         f"• Активные мониторинги: {len([k for k, v in active_monitors.items() if v])}\n\n"
+        f"💧 <b>WebSocket ликвидации:</b>\n"
+        f"• Статус: {'✅ Активен' if ws_running else '❌ Остановлен'}\n"
+        f"• Пар с данными: {ws_pairs}\n"
+        f"• Общая сумма: {ws_total:,.0f}$\n\n"
         f"⚙️ <b>Настройки:</b>\n{settings_str}\n\n"
         f"📈 <b>Счетчики сигналов:</b>\n{counters_info}\n\n"
         f"🔄 <b>Сбросы:</b>\n"
@@ -1433,7 +1519,8 @@ def help_command(message):
         "🆘 <b>СПРАВКА ПО КОМАНДАМ</b>\n\n"
         "🎯 <b>Основные команды:</b>\n"
         "/start - Главное меню и информация\n"
-        "/help - Эта справка\n\n"
+        "/help - Эта справка\n"
+        "/liq_stats - Статистика WebSocket ликвидаций\n\n"
         "⚙️ <b>Настройки и управление:</b>\n"
         "/stop - Остановить мониторинг\n"
         "/status - Статус мониторинга\n"
@@ -1448,10 +1535,9 @@ def help_command(message):
         "🔧 Режим - Настройка триггеров и бирж\n"
         "ℹ️ Помощь - Информация о боте\n\n"
         "💡 <b>Новые функции:</b>\n"
+        "• WebSocket ликвидации в реальном времени\n"
         "• Поддержка Binance + Bybit\n"
-        "• Режим ANY (любой триггер) или ALL (все триггеры)\n"
-        "• Исправлены ликвидации\n"
-        "• В сигналах указывается биржа"
+        "• Режим ANY (любой триггер) или ALL (все триггеры)"
     )
     bot.send_message(message.chat.id, help_msg, parse_mode='HTML')
 
@@ -1471,8 +1557,8 @@ def price_btn(message):
     data = get_binance_ticker("BTCUSDT")
     if data:
         update_time = datetime.fromtimestamp(data['timestamp'] / 1000).strftime('%H:%M:%S')
-        total_liq, _, _ = get_binance_liquidations("BTCUSDT")
-        liq_info = f"Ликвидации 24ч: {total_liq:,.0f}$" if total_liq > 0 else "Ликвидации: нет данных"
+        total_liq, long_liq, short_liq = get_ws_liquidations("BTCUSDT", "binance")
+        liq_info = f"Ликвидации 24ч (WS): {total_liq:,.0f}$" if total_liq > 0 else "Ликвидации: ожидание данных..."
 
         msg = (
             f"💰 <b>BTC/USDT (Binance)</b>\n\n"
@@ -1506,13 +1592,13 @@ def scan_btn(message):
 
             if analysis['total_liq'] > 0:
                 liq_info = (
-                    f"💧 <b>Ликвидации:</b>\n"
+                    f"💧 <b>Ликвидации (WS):</b>\n"
                     f"• Всего: <b>{analysis['total_liq']:,.0f}$</b>\n"
                     f"• Long: <b>{analysis['long_liq']:,.0f}$</b>\n"
                     f"• Short: <b>{analysis['short_liq']:,.0f}$</b>\n"
                 )
             else:
-                liq_info = "💧 <b>Ликвидации:</b> Данные временно недоступны\n"
+                liq_info = "💧 <b>Ликвидации:</b> ожидание данных...\n"
 
             interval_key = SUPPORTED_INTERVALS.get(interval, "15m")
             interval_name = INTERVAL_READABLE.get(interval_key, interval_key)
@@ -1569,6 +1655,7 @@ def setup_signals(message):
         f"🔔 OI: {'✅ ВКЛ' if settings.get('enable_oi', True) else '❌ ВЫКЛ'} | Порог: {settings.get('oi_threshold', 5.0)}%\n"
         f"🔔 Ликвидации: {'✅ ВКЛ' if settings.get('enable_liq', True) else '❌ ВЫКЛ'} | Порог: {settings.get('liq_threshold', 1000000):,.0f}$\n"
         f"⏱ Интервал: {interval_name}\n\n"
+        f"💧 Ликвидации собираются через WebSocket\n\n"
         f"Выберите параметр для изменения:"
     )
 
@@ -1757,17 +1844,28 @@ def save_settings(message):
         f"📈 Порог OI: <b>{settings.get('oi_threshold', 5.0)}%</b>\n"
         f"💧 Порог ликвидаций: <b>{settings.get('liq_threshold', 1000000):,.0f}$</b>\n"
         f"⏱ Интервал анализа: <b>{interval_name}</b>\n\n"
+        f"💧 Ликвидации: WebSocket (реальное время)\n\n"
         "🚀 <b>Что дальше:</b>\n"
         "1. Нажмите 🚀 Запустить для запуска мониторинга\n"
         "2. Используйте /test_conditions для проверки настроек\n"
         "3. Отслеживайте прогресс через 📡 Статус\n"
-        "4. При необходимости настройте параметры заново"
+        "4. Используйте /liq_stats для статистики ликвидаций"
     )
 
     bot.send_message(chat_id, settings_message, parse_mode='HTML', reply_markup=get_main_keyboard())
 
 
 if __name__ == "__main__":
+    # Устанавливаем библиотеку websockets если её нет
+    try:
+        import websockets
+    except ImportError:
+        logger.info("📦 Устанавливаю websockets...")
+        import subprocess
+
+        subprocess.check_call(["pip", "install", "websockets"])
+        import websockets
+
     logger.info("🚀 Бот запускается...")
 
     try:
@@ -1776,6 +1874,10 @@ if __name__ == "__main__":
         logger.info(
             f"✅ Загружено {len(available_pairs['binance'])} пар Binance и {len(available_pairs['bybit'])} пар Bybit")
 
+        # Запускаем WebSocket коллекторы ликвидаций
+        start_ws_collectors()
+        logger.info("💧 WebSocket коллекторы ликвидаций запущены")
+
         logger.info("🤖 Бот готов к работе!")
         logger.info("📱 Используйте /start для начала работы")
 
@@ -1783,14 +1885,17 @@ if __name__ == "__main__":
 
     except KeyboardInterrupt:
         logger.info("Бот остановлен пользователем (Ctrl+C)")
+        stop_ws_collectors()
         for chat_id in list(active_monitors.keys()):
             stop_monitor(chat_id)
     except Exception as e:
         logger.error(f"💥 Критическая ошибка: {e}", exc_info=True)
+        stop_ws_collectors()
         logger.info("🔄 Попытка перезапуска через 10 секунд...")
         time.sleep(10)
 
         try:
+            start_ws_collectors()
             bot.infinity_polling(timeout=60, long_polling_timeout=60)
         except Exception as e2:
             logger.error(f"💥 Повторная критическая ошибка: {e2}")
