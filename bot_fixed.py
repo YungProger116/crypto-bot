@@ -318,13 +318,19 @@ def get_bybit_ticker(symbol="BTCUSDT"):
         ticker = ticker_data['result']['list'][0]
 
         oi_response = REQUEST_SESSION.get(
-            f"{BYBIT_API_URL}/v5/market/open-interest?category=linear&symbol={symbol}",
+            f"{BYBIT_API_URL}/v5/market/open-interest",
+            params={
+                'category': 'linear',
+                'symbol': symbol,
+                'intervalTime': '15min',
+                'limit': 1
+            },
             timeout=10, verify=True
         )
         oi_response.raise_for_status()
         oi_data = oi_response.json()
 
-        oi_value = 0
+        oi_value = 0.0
         if oi_data.get('retCode') == 0 and oi_data['result']['list']:
             oi_value = float(oi_data['result']['list'][0]['openInterest'])
 
@@ -430,7 +436,12 @@ def get_bybit_liquidations(symbol="BTCUSDT"):
         long_liq = 0.0
         short_liq = 0.0
 
+        time_threshold = int((time.time() - 86400) * 1000)
         for order in data['result']['list']:
+            order_time = int(order.get('updatedTime', 0))
+            if order_time < time_threshold:
+                continue
+
             value = float(order['size']) * float(order['price'])
             if order['side'] == 'Sell':
                 long_liq += value
@@ -703,21 +714,12 @@ def check_signal_conditions(analysis, settings, chat_id, symbol, exchange):
 
     with oi_lock:
         if prev_oi_key not in prev_oi_data:
-            prev_oi_data[prev_oi_key] = {
-                'value': oi,
-                'first_measurement': True
-            }
+            prev_oi_data[prev_oi_key] = {'value': oi}
             oi_change_pct = 0.0
         else:
-            prev_data = prev_oi_data[prev_oi_key]
-            prev_oi_value = prev_data['value']
-            oi_change_pct = ((oi - prev_oi_value) / prev_oi_value) * 100 if prev_oi_value != 0 else 0.0
-
-            if not prev_data['first_measurement']:
-                prev_oi_data[prev_oi_key]['value'] = oi
-            else:
-                prev_oi_data[prev_oi_key]['first_measurement'] = False
-                prev_oi_data[prev_oi_key]['value'] = oi
+            prev_oi_value = prev_oi_data[prev_oi_key]['value']
+            oi_change_pct = ((oi - prev_oi_value) / prev_oi_value * 100) if prev_oi_value != 0 else 0.0
+            prev_oi_data[prev_oi_key]['value'] = oi
 
     enable_price = settings.get('enable_price', True)
     enable_volume = settings.get('enable_volume', True)
@@ -926,9 +928,9 @@ def start_auto_signals(message):
                 if num_symbols < 50:
                     max_workers = 5
                 elif num_symbols < 100:
-                    max_workers = 10
+                    max_workers = 8
                 else:
-                    max_workers = 20
+                    max_workers = 15
 
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     future_to_symbol = {}
